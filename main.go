@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -22,6 +23,9 @@ const (
 	timeDriftThreshold = 10 * time.Minute
 
 	systemTimePrivilegeName = "SeSystemtimePrivilege"
+
+	timeAPIURL        = "https://timeapi.io/api/time/current/zone?timeZone=Asia/Ho_Chi_Minh"
+	timeAPITimeLayout = "2006-01-02T15:04:05"
 )
 
 var procSetSystemTime = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetSystemTime")
@@ -30,22 +34,32 @@ type program struct {
 	job *cron.Cron
 }
 
-func (p *program) getTimeFromGoogleHeader() (time.Time, error) {
-	resp, err := http.Head("https://google.com")
+type timeAPIResponse struct {
+	DateTime string `json:"dateTime"`
+}
+
+func (p *program) getTimeFromTimeAPI() (time.Time, error) {
+	resp, err := http.Get(timeAPIURL)
 	if err != nil {
 		return time.Time{}, err
 	}
 	defer resp.Body.Close()
 
-	dateStr := resp.Header.Get("Date")
+	if resp.StatusCode != http.StatusOK {
+		return time.Time{}, fmt.Errorf("timeapi.io trả về mã lỗi %d", resp.StatusCode)
+	}
 
-	gmtTime, err := time.Parse(time.RFC1123, dateStr)
+	var payload timeAPIResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return time.Time{}, fmt.Errorf("không parse được phản hồi từ timeapi.io: %w", err)
+	}
+
+	loc, err := time.LoadLocation("Asia/Ho_Chi_Minh")
 	if err != nil {
 		return time.Time{}, err
 	}
 
-	loc, _ := time.LoadLocation("Asia/Ho_Chi_Minh")
-	return gmtTime.In(loc), nil
+	return time.ParseInLocation(timeAPITimeLayout, payload.DateTime, loc)
 }
 
 func enableSystemTimePrivilege() error {
@@ -109,18 +123,18 @@ func (p *program) isTimeDrifted(localTime, referenceTime time.Time, threshold ti
 }
 
 func (p *program) syncSystemTimeIfDrifted() error {
-	googleTime, err := p.getTimeFromGoogleHeader()
+	referenceTime, err := p.getTimeFromTimeAPI()
 	if err != nil {
-		return fmt.Errorf("không lấy được giờ từ Google: %w", err)
+		return fmt.Errorf("không lấy được giờ từ timeapi.io: %w", err)
 	}
 
 	localTime := time.Now()
 
-	if !p.isTimeDrifted(localTime, googleTime, timeDriftThreshold) {
+	if !p.isTimeDrifted(localTime, referenceTime, timeDriftThreshold) {
 		return nil
 	}
 
-	return p.setWindowsTime(googleTime)
+	return p.setWindowsTime(referenceTime)
 }
 
 func (p *program) Start(s service.Service) error {
@@ -175,7 +189,7 @@ func main() {
 	s, _ := service.New(&program{}, &service.Config{
 		Name:        "TimeKeeper",
 		DisplayName: "Time Keeper",
-		Description: "Automatically syncs the system time with Google's time server.",
+		Description: "Automatically syncs the system time with timeapi.io.",
 	})
 
 	if service.Interactive() && !isRunningElevated() {
