@@ -1,47 +1,39 @@
-//go:build windows
-
 package main
 
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
-	"os"
-	"path/filepath"
-	"strings"
-	"syscall"
+	"os/exec"
 	"time"
-	"unsafe"
 
 	"github.com/kardianos/service"
-	"github.com/robfig/cron/v3"
-	"golang.org/x/sys/windows"
 )
+
+type program struct{}
 
 const (
-	timeDriftThreshold = 10 * time.Minute
+	timeAPIURL         = "https://timeapi.io/api/time/current/zone?timeZone=Asia/Ho_Chi_Minh"
+	timeAPITimeLayout  = "2006-01-02T15:04:05"
+	systemLocationName = "Asia/Ho_Chi_Minh"
 
-	systemTimePrivilegeName = "SeSystemtimePrivilege"
+	// Định dạng theo Short Date mặc định của Windows tại Việt Nam (dd/MM/yyyy).
+	// Nếu máy đích cấu hình Regional Settings khác, cần đổi lại cho khớp.
+	systemDateLayout  = "02/01/2006"
+	systemClockLayout = "15:04:05"
 
-	timeAPIURL        = "https://timeapi.io/api/time/current/zone?timeZone=Asia/Ho_Chi_Minh"
-	timeAPITimeLayout = "2006-01-02T15:04:05"
+	syncInterval = 10 * time.Second
 )
-
-var procSetSystemTime = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetSystemTime")
-
-type program struct {
-	job *cron.Cron
-}
 
 type timeAPIResponse struct {
 	DateTime string `json:"dateTime"`
 }
 
+// getTimeFromTimeAPI lấy thời gian chuẩn theo múi giờ Asia/Ho_Chi_Minh từ timeapi.io.
 func (p *program) getTimeFromTimeAPI() (time.Time, error) {
 	resp, err := http.Get(timeAPIURL)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, fmt.Errorf("không gọi được timeapi.io: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -54,171 +46,114 @@ func (p *program) getTimeFromTimeAPI() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("không parse được phản hồi từ timeapi.io: %w", err)
 	}
 
-	loc, err := time.LoadLocation("Asia/Ho_Chi_Minh")
+	loc, err := time.LoadLocation(systemLocationName)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, fmt.Errorf("không tải được múi giờ %s: %w", systemLocationName, err)
 	}
 
 	return time.ParseInLocation(timeAPITimeLayout, payload.DateTime, loc)
 }
 
-func enableSystemTimePrivilege() error {
-	var token windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token); err != nil {
-		return fmt.Errorf("không mở được process token: %w", err)
-	}
-	defer token.Close()
-
-	privilegeName, err := windows.UTF16PtrFromString(systemTimePrivilegeName)
-	if err != nil {
-		return err
-	}
-
-	var luid windows.LUID
-	if err := windows.LookupPrivilegeValue(nil, privilegeName, &luid); err != nil {
-		return fmt.Errorf("không tra được LUID cho %s: %w", systemTimePrivilegeName, err)
-	}
-
-	privileges := windows.Tokenprivileges{
-		PrivilegeCount: 1,
-		Privileges: [1]windows.LUIDAndAttributes{
-			{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED},
-		},
-	}
-
-	if err := windows.AdjustTokenPrivileges(token, false, &privileges, 0, nil, nil); err != nil {
-		return fmt.Errorf("không bật được %s: %w", systemTimePrivilegeName, err)
+// setSystemDate đặt ngày hệ thống Windows bằng lệnh cmd nội trú "date".
+func (p *program) setSystemDate(t time.Time) error {
+	dateValue := t.Format(systemDateLayout)
+	cmd := exec.Command("cmd", "/C", fmt.Sprintf("date %s", dateValue))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("không đặt được ngày hệ thống (%s): %w", dateValue, err)
 	}
 	return nil
 }
 
-func (p *program) setWindowsTime(t time.Time) error {
-	if err := enableSystemTimePrivilege(); err != nil {
-		return err
-	}
-
-	utcTime := t.UTC()
-	systemTime := windows.Systemtime{
-		Year:   uint16(utcTime.Year()),
-		Month:  uint16(utcTime.Month()),
-		Day:    uint16(utcTime.Day()),
-		Hour:   uint16(utcTime.Hour()),
-		Minute: uint16(utcTime.Minute()),
-		Second: uint16(utcTime.Second()),
-	}
-
-	ret, _, callErr := procSetSystemTime.Call(uintptr(unsafe.Pointer(&systemTime)))
-	if ret == 0 {
-		return fmt.Errorf("SetSystemTime thất bại: %w", callErr)
+// setSystemClock đặt giờ hệ thống Windows bằng lệnh cmd nội trú "time".
+func (p *program) setSystemClock(t time.Time) error {
+	timeValue := t.Format(systemClockLayout)
+	cmd := exec.Command("cmd", "/C", fmt.Sprintf("time %s", timeValue))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("không đặt được giờ hệ thống (%s): %w", timeValue, err)
 	}
 	return nil
 }
 
-func (p *program) isTimeDrifted(localTime, referenceTime time.Time, threshold time.Duration) bool {
-	drift := localTime.Sub(referenceTime)
-	if drift < 0 {
-		drift = -drift
-	}
-	return drift > threshold
-}
-
-func (p *program) syncSystemTimeIfDrifted() error {
+// updateSystemTime đồng bộ ngày giờ hệ thống theo thời gian chuẩn lấy từ timeapi.io.
+func (p *program) updateSystemTime() error {
 	referenceTime, err := p.getTimeFromTimeAPI()
 	if err != nil {
-		return fmt.Errorf("không lấy được giờ từ timeapi.io: %w", err)
+		return err
 	}
 
-	localTime := time.Now()
-
-	if !p.isTimeDrifted(localTime, referenceTime, timeDriftThreshold) {
-		return nil
+	if err := p.setSystemDate(referenceTime); err != nil {
+		return err
 	}
 
-	return p.setWindowsTime(referenceTime)
+	if err := p.setSystemClock(referenceTime); err != nil {
+		return err
+	}
+
+	fmt.Println("-> Cập nhật thành công! Hãy kiểm tra đồng hồ máy tính.")
+	return nil
 }
 
 func (p *program) Start(s service.Service) error {
-	p.job = cron.New()
-	p.job.AddFunc("@every 1", func() {
-		if err := p.syncSystemTimeIfDrifted(); err != nil {
-			fmt.Println("Error:", err)
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		if err := p.updateSystemTime(); err != nil {
+			fmt.Println("Lỗi:", err)
 		}
-	})
-	p.job.Start()
+	}
+
 	return nil
 }
 
 func (p *program) Stop(s service.Service) error {
-	if p.job != nil {
-		p.job.Stop()
-	}
 	return nil
 }
 
-func isRunningElevated() bool {
-	return windows.GetCurrentProcessToken().IsElevated()
-}
-
-func relaunchElevated() error {
-	exePath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("không xác định được đường dẫn thực thi: %w", err)
-	}
-
-	verbPtr, err := syscall.UTF16PtrFromString("runas")
-	if err != nil {
-		return err
-	}
-	exePtr, err := syscall.UTF16PtrFromString(exePath)
-	if err != nil {
-		return err
-	}
-	cwdPtr, err := syscall.UTF16PtrFromString(filepath.Dir(exePath))
-	if err != nil {
-		return err
-	}
-	argPtr, err := syscall.UTF16PtrFromString(strings.Join(os.Args[1:], " "))
-	if err != nil {
-		return err
-	}
-
-	return windows.ShellExecute(0, verbPtr, exePtr, argPtr, cwdPtr, windows.SW_NORMAL)
-}
-
 func main() {
-	s, _ := service.New(&program{}, &service.Config{
-		Name:        "TimeKeeper",
-		DisplayName: "Time Keeper",
-		Description: "Automatically syncs the system time with timeapi.io.",
-	})
+	p := &program{}
 
-	if service.Interactive() && !isRunningElevated() {
-		if err := relaunchElevated(); err != nil {
-			log.Fatalf("Cần quyền Administrator để chạy chương trình: %v", err)
-		}
+	tt, err := p.getTimeFromTimeAPI()
+	if err != nil {
+		fmt.Println("Lỗi:", err)
 		return
 	}
 
-	if len(os.Args) > 1 {
-		if err := service.Control(s, os.Args[1]); err != nil {
-			log.Fatal(err)
-		}
-		return
-	}
+	fmt.Println("Thời gian chuẩn theo múi giờ Asia/Ho_Chi_Minh:", tt.Format(time.RFC1123))
 
-	if service.Interactive() {
-		log.Println("Install windows service")
-		if err := service.Control(s, "install"); err != nil {
-			log.Fatal(err)
-		}
-		log.Println("Start windows service")
-		if err := service.Control(s, "start"); err != nil {
-			log.Fatal(err)
-		}
-		log.Println("Service installed and started successfully.")
-		time.Sleep(5 * time.Second)
-		return
-	}
+	time.Sleep(30 * time.Second)
 
-	s.Run()
+	// s, _ := service.New(&program{}, &service.Config{
+	// 	Name:        "LocalTime",
+	// 	DisplayName: "Local Time",
+	// 	Description: "Cập nhật thời gian hệ thống theo múi giờ Asia/Ho_Chi_Minh",
+	// })
+
+	// if len(os.Args) > 1 {
+	// 	service.Control(s, os.Args[1])
+	// 	return
+	// }
+
+	// if service.Interactive() {
+	// 	fmt.Println("Đang cài đặt Windows Service...")
+	// 	if err := service.Control(s, "install"); err != nil {
+	// 		fmt.Println("Lỗi cài đặt (có thể do chưa chạy Run as Administrator hoặc đã cài rồi):", err)
+	// 	} else {
+	// 		fmt.Println("Cài đặt thành công!")
+	// 	}
+
+	// 	fmt.Println("Đang khởi động Service...")
+	// 	if err := service.Control(s, "start"); err != nil {
+	// 		fmt.Println("Lỗi khởi động (hoặc service đang chạy rồi):", err)
+	// 	} else {
+	// 		fmt.Println("Khởi động thành công!")
+	// 	}
+
+	// 	fmt.Println("Xong! Cửa sổ sẽ tự đóng sau 5 giây.")
+	// 	time.Sleep(5 * time.Second)
+	// 	return
+	// }
+
+	// s.Run()
+
 }
