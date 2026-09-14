@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"time"
 
 	"github.com/kardianos/service"
+
+	_ "time/tzdata"
 )
 
 type program struct{}
@@ -94,6 +97,15 @@ func (p *program) updateSystemTime() error {
 }
 
 func (p *program) Start(s service.Service) error {
+	go p.run()
+	return nil
+}
+
+func (p *program) run() {
+	if err := p.updateSystemTime(); err != nil {
+		fmt.Println("Lỗi:", err)
+	}
+
 	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 
@@ -102,8 +114,6 @@ func (p *program) Start(s service.Service) error {
 			fmt.Println("Lỗi:", err)
 		}
 	}
-
-	return nil
 }
 
 func (p *program) Stop(s service.Service) error {
@@ -111,49 +121,36 @@ func (p *program) Stop(s service.Service) error {
 }
 
 func main() {
-	p := &program{}
+	s, _ := service.New(&program{}, &service.Config{
+		Name:        "LocalTime",
+		DisplayName: "Local Time Keeper",
+		Description: "Cập nhật thời gian hệ thống theo múi giờ Asia/Ho_Chi_Minh",
+	})
 
-	tt, err := p.getTimeFromTimeAPI()
-	if err != nil {
-		fmt.Println("Lỗi:", err)
+	if len(os.Args) > 1 {
+		service.Control(s, os.Args[1])
 		return
 	}
 
-	fmt.Println("Thời gian chuẩn theo múi giờ Asia/Ho_Chi_Minh:", tt.Format(time.RFC1123))
+	if service.Interactive() {
+		fmt.Println("Đang cài đặt Windows Service...")
+		if err := service.Control(s, "install"); err != nil {
+			fmt.Println("Lỗi cài đặt (có thể do chưa chạy Run as Administrator hoặc đã cài rồi):", err)
+		} else {
+			fmt.Println("Cài đặt thành công!")
+		}
+		time.Sleep(10 * time.Second)
+		fmt.Println("Đang khởi động Service...")
+		if err := service.Control(s, "start"); err != nil {
+			fmt.Println("Lỗi khởi động (hoặc service đang chạy rồi):", err)
+		} else {
+			fmt.Println("Khởi động thành công!")
+		}
 
-	time.Sleep(30 * time.Second)
+		fmt.Println("Xong! Cửa sổ sẽ tự đóng sau 5 giây.")
+		time.Sleep(10 * time.Second)
+		return
+	}
 
-	// s, _ := service.New(&program{}, &service.Config{
-	// 	Name:        "LocalTime",
-	// 	DisplayName: "Local Time",
-	// 	Description: "Cập nhật thời gian hệ thống theo múi giờ Asia/Ho_Chi_Minh",
-	// })
-
-	// if len(os.Args) > 1 {
-	// 	service.Control(s, os.Args[1])
-	// 	return
-	// }
-
-	// if service.Interactive() {
-	// 	fmt.Println("Đang cài đặt Windows Service...")
-	// 	if err := service.Control(s, "install"); err != nil {
-	// 		fmt.Println("Lỗi cài đặt (có thể do chưa chạy Run as Administrator hoặc đã cài rồi):", err)
-	// 	} else {
-	// 		fmt.Println("Cài đặt thành công!")
-	// 	}
-
-	// 	fmt.Println("Đang khởi động Service...")
-	// 	if err := service.Control(s, "start"); err != nil {
-	// 		fmt.Println("Lỗi khởi động (hoặc service đang chạy rồi):", err)
-	// 	} else {
-	// 		fmt.Println("Khởi động thành công!")
-	// 	}
-
-	// 	fmt.Println("Xong! Cửa sổ sẽ tự đóng sau 5 giây.")
-	// 	time.Sleep(5 * time.Second)
-	// 	return
-	// }
-
-	// s.Run()
-
+	s.Run()
 }
