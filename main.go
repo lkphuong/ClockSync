@@ -7,11 +7,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/kardianos/service"
 	"github.com/robfig/cron/v3"
@@ -20,8 +20,11 @@ import (
 
 const (
 	timeDriftThreshold = 10 * time.Minute
-	checkInterval      = 5 * time.Minute
+
+	systemTimePrivilegeName = "SeSystemtimePrivilege"
 )
+
+var procSetSystemTime = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetSystemTime")
 
 type program struct {
 	job *cron.Cron
@@ -45,12 +48,56 @@ func (p *program) getTimeFromGoogleHeader() (time.Time, error) {
 	return gmtTime.In(loc), nil
 }
 
+func enableSystemTimePrivilege() error {
+	var token windows.Token
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_ADJUST_PRIVILEGES|windows.TOKEN_QUERY, &token); err != nil {
+		return fmt.Errorf("không mở được process token: %w", err)
+	}
+	defer token.Close()
+
+	privilegeName, err := windows.UTF16PtrFromString(systemTimePrivilegeName)
+	if err != nil {
+		return err
+	}
+
+	var luid windows.LUID
+	if err := windows.LookupPrivilegeValue(nil, privilegeName, &luid); err != nil {
+		return fmt.Errorf("không tra được LUID cho %s: %w", systemTimePrivilegeName, err)
+	}
+
+	privileges := windows.Tokenprivileges{
+		PrivilegeCount: 1,
+		Privileges: [1]windows.LUIDAndAttributes{
+			{Luid: luid, Attributes: windows.SE_PRIVILEGE_ENABLED},
+		},
+	}
+
+	if err := windows.AdjustTokenPrivileges(token, false, &privileges, 0, nil, nil); err != nil {
+		return fmt.Errorf("không bật được %s: %w", systemTimePrivilegeName, err)
+	}
+	return nil
+}
+
 func (p *program) setWindowsTime(t time.Time) error {
-	timeStr := t.Format("2006-01-02 15:04:05")
+	if err := enableSystemTimePrivilege(); err != nil {
+		return err
+	}
 
-	cmd := fmt.Sprintf(`powershell -Command "Set-Date -Date '%s'"`, timeStr)
+	utcTime := t.UTC()
+	systemTime := windows.Systemtime{
+		Year:   uint16(utcTime.Year()),
+		Month:  uint16(utcTime.Month()),
+		Day:    uint16(utcTime.Day()),
+		Hour:   uint16(utcTime.Hour()),
+		Minute: uint16(utcTime.Minute()),
+		Second: uint16(utcTime.Second()),
+	}
 
-	return exec.Command("cmd", "/C", cmd).Run()
+	ret, _, callErr := procSetSystemTime.Call(uintptr(unsafe.Pointer(&systemTime)))
+	if ret == 0 {
+		return fmt.Errorf("SetSystemTime thất bại: %w", callErr)
+	}
+	return nil
 }
 
 func (p *program) isTimeDrifted(localTime, referenceTime time.Time, threshold time.Duration) bool {
