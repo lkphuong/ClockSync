@@ -1,3 +1,5 @@
+//go:build windows
+
 package main
 
 import (
@@ -6,10 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/kardianos/service"
 	"github.com/robfig/cron/v3"
+	"golang.org/x/sys/windows"
 )
 
 const (
@@ -72,7 +78,7 @@ func (p *program) syncSystemTimeIfDrifted() error {
 
 func (p *program) Start(s service.Service) error {
 	p.job = cron.New()
-	p.job.AddFunc("@every 10m", func() {
+	p.job.AddFunc("@every 1", func() {
 		if err := p.syncSystemTimeIfDrifted(); err != nil {
 			fmt.Println("Error:", err)
 		}
@@ -88,6 +94,36 @@ func (p *program) Stop(s service.Service) error {
 	return nil
 }
 
+func isRunningElevated() bool {
+	return windows.GetCurrentProcessToken().IsElevated()
+}
+
+func relaunchElevated() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("không xác định được đường dẫn thực thi: %w", err)
+	}
+
+	verbPtr, err := syscall.UTF16PtrFromString("runas")
+	if err != nil {
+		return err
+	}
+	exePtr, err := syscall.UTF16PtrFromString(exePath)
+	if err != nil {
+		return err
+	}
+	cwdPtr, err := syscall.UTF16PtrFromString(filepath.Dir(exePath))
+	if err != nil {
+		return err
+	}
+	argPtr, err := syscall.UTF16PtrFromString(strings.Join(os.Args[1:], " "))
+	if err != nil {
+		return err
+	}
+
+	return windows.ShellExecute(0, verbPtr, exePtr, argPtr, cwdPtr, windows.SW_NORMAL)
+}
+
 func main() {
 	s, _ := service.New(&program{}, &service.Config{
 		Name:        "TimeKeeper",
@@ -95,8 +131,17 @@ func main() {
 		Description: "Automatically syncs the system time with Google's time server.",
 	})
 
+	if service.Interactive() && !isRunningElevated() {
+		if err := relaunchElevated(); err != nil {
+			log.Fatalf("Cần quyền Administrator để chạy chương trình: %v", err)
+		}
+		return
+	}
+
 	if len(os.Args) > 1 {
-		service.Control(s, os.Args[1])
+		if err := service.Control(s, os.Args[1]); err != nil {
+			log.Fatal(err)
+		}
 		return
 	}
 
