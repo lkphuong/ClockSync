@@ -71,6 +71,12 @@ SectionEnd
 
 Section "Uninstall"
 
+    ; Dừng Windows Service trước khi xóa file để tránh bị khóa file (file lock)
+    ExecWait '"$INSTDIR\${APP_EXE}" stop'
+
+    ; Gỡ đăng ký Windows Service khỏi Service Control Manager
+    ExecWait '"$INSTDIR\${APP_EXE}" uninstall'
+
     ; Xóa TimeKeeper.exe
     Delete "$INSTDIR\${APP_EXE}"
 
