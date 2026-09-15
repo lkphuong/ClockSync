@@ -15,7 +15,7 @@ const (
 	timeAPITimeLayout  = "2006-01-02T15:04:05"
 	systemLocationName = "Asia/Ho_Chi_Minh"
 
-	syncInterval    = 1 * time.Minute
+	syncInterval    = 5 * time.Minute
 	maxAllowedDrift = 10 * time.Minute
 )
 
